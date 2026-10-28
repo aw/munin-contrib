@@ -1,0 +1,313 @@
+#!/bin/bash
+# -*- sh -*-
+
+: << =cut
+
+=head1 NAME
+
+amd_gpu_ - Wildcard plugin to monitor AMD GPUs. Uses rocm-smi utility
+(ROCm System Management Interface) to obtain information.
+
+=head1 CONFIGURATION
+
+This is a wildcard plugin. The wildcard prefix link name should be the
+value to monitor.
+
+This plugin uses the following configuration variables:
+
+ [amd_gpu_*]
+  env.warning - Warning temperature
+  env.critical - Critical temperature
+
+=head2 DEFAULT CONFIGURATION
+
+The default configuration is to set warning and critical temperatures of
+75 and 95 degrees celsius, respectively.
+
+=head2 EXAMPLE WILDCARD USAGE
+
+C<ln -s /usr/share/munin/plugins/amd_gpu_ /etc/munin/plugins/amd_gpu_temp>
+
+...will monitor the temperature of available GPUs.
+
+=head1 NOTES
+
+- Requires rocm-smi with --json support and jq installed.
+- ROCm 4.0+ uses separate flags (e.g. --showmetrics, --showmemuse) instead
+  of the -q query flag. This plugin calls rocm-smi -a --json for a complete
+  JSON snapshot. Older ROCm versions that lack -a --json will not work.
+- On some AMD consumer cards (RX series), PCIe cumulative bandwidth counters
+  (rx/tx) report "N/A". This is a hardware/driver limitation, not a plugin
+  issue.
+- Fan speed may report "0" on passively-cooled cards or when idle.
+
+=head1 TODO
+
+=over 4
+
+=item *
+
+Add support for per-GPU VRAM absolute values (used/free in MiB).
+
+=back
+
+=head1 AUTHOR
+
+Based on nvidia_gpu_ by Nuno Fachada (faken@fakenmc.com)
+
+=head1 LICENSE
+
+ GNU General Public License, version 2
+ http://www.gnu.org/licenses/gpl-2.0.html
+
+=head1 MAGIC MARKERS
+
+ #%# family=auto
+ #%# capabilities=autoconf suggest
+
+=cut
+
+set -e
+
+# Determine name of parameter to monitor
+name=$(basename "$0" | sed 's/^amd_gpu_//g')
+
+# Get location of rocm-smi executable or use default
+rocmSmiExec=${rocmsmiexec:-'/usr/bin/rocm-smi'}
+jqExec=${jexec:-'/usr/bin/jq'}
+
+# Temperature thresholds
+warn_temp=${warning:-75}
+crit_temp=${critical:-95}
+
+# Check if rocm-smi exists and is executable
+if [ ! -x "$rocmSmiExec" ]; then
+	if [ "$1" = "autoconf" ]; then
+		echo "no (rocm-smi executable not found)"
+		exit 0
+	fi
+	echo "Error: rocm-smi not found at $rocmSmiExec" >&2
+	exit 1
+fi
+
+# Check autoconf
+if [ "$1" = "autoconf" ]; then
+	output=$("$rocmSmiExec" -a --json 2>/dev/null)
+	if [ $? -eq 0 ] && [ -n "$output" ]; then
+		echo yes
+		exit 0
+	else
+		echo "no (rocm-smi -a --json failed)"
+		exit 0
+	fi
+fi
+
+# Check suggest
+if [ "$1" = "suggest" ]; then
+	echo "temp"
+	echo "mem"
+	echo "fan"
+	echo "power"
+	echo "utilization"
+	echo "rx"
+	echo "tx"
+	exit 0
+fi
+
+# Get complete JSON snapshot from rocm-smi
+rocmJson=$("$rocmSmiExec" -a --json 2>/dev/null)
+if [ $? -ne 0 ] || [ -z "$rocmJson" ]; then
+	if [ "$1" = "config" ]; then
+		echo "Error: rocm-smi -a --json returned no output" >&2
+	fi
+	exit 1
+fi
+
+# Count GPUs
+nGpus=$($jqExec -r 'keys[] | select(startswith("card"))' <<< "$rocmJson" | wc -l)
+if [ "$nGpus" -eq 0 ]; then
+	if [ "$1" = "config" ]; then
+		echo "No AMD GPUs detected. Exiting." >&2
+	fi
+	exit 1
+fi
+
+# Get driver version
+driverVersion=$($jqExec -r '.system."Driver version"' <<< "$rocmJson" 2>/dev/null)
+
+# Get GPU name for a given card index
+get_gpu_name() {
+	local card_key
+	card_key=$($jqExec -r "keys[] | select(startswith(\"card$1\"))" <<< "$rocmJson" 2>/dev/null)
+	[ -z "$card_key" ] && card_key="card$1"
+	$jqExec -r --arg k "$card_key" '.[$k]."Device Name"' <<< "$rocmJson" 2>/dev/null
+}
+
+# Get a metric value from a card by index (returns raw value from JSON, including N/A)
+# Sets the global variable get_metric_result
+get_metric() {
+	local card_key
+	card_key=$($jqExec -r "keys[] | select(startswith(\"card$1\"))" <<< "$rocmJson" 2>/dev/null)
+	[ -z "$card_key" ] && card_key="card$1"
+	get_metric_result=$($jqExec -r --arg k "$card_key" --arg k2 "$2" '.[$k][$k2] // empty' <<< "$rocmJson" 2>/dev/null)
+}
+
+# Convert a raw rocm-smi JSON value to a numeric string suitable for munin
+# Handles: bare numbers, N/A, null, arrays
+get_metric_num() {
+	local raw="$1"
+	case "$raw" in
+		N/A|n/a|"")
+			echo "0"
+			;;
+		null)
+			echo "0"
+			;;
+		*'N/A'*|*null*)
+			# Array values like ["N/A","N/A]
+			echo "0"
+			;;
+		*)
+			# Number or number-like — use jq to normalize
+			echo "$raw" | $jqExec -R "tonumber? // 0" 2>/dev/null
+			;;
+	esac
+}
+
+# --- config mode ---
+if [ "$1" = "config" ]; then
+	case $name in
+		temp)
+			echo 'graph_title GPU temperature'
+			echo 'graph_args -l 0 -u 120'
+			echo 'graph_vlabel degrees Celsius'
+			echo 'graph_category sensors'
+			echo "graph_info Temperature information for AMD GPUs using driver version $driverVersion"
+			;;
+		mem)
+			echo 'graph_title GPU VRAM usage'
+			echo 'graph_args -l 0 -u 100'
+			echo 'graph_vlabel %'
+			echo 'graph_category memory'
+			echo "graph_info VRAM Memory usage for AMD GPUs using driver version $driverVersion"
+			;;
+		fan)
+			echo 'graph_title GPU fan speed'
+			echo 'graph_vlabel RPM'
+			echo 'graph_category sensors'
+			echo "graph_info Fan speed of AMD GPUs using driver version $driverVersion"
+			;;
+		power)
+			echo 'graph_title GPU power consumption'
+			echo 'graph_vlabel Watts'
+			echo 'graph_category sensors'
+			echo "graph_info Power consumption of AMD GPUs using driver version $driverVersion"
+			;;
+		utilization)
+			echo 'graph_title GPU power load'
+			echo 'graph_args -l 0 -u 100'
+			echo 'graph_vlabel %'
+			echo 'graph_category system'
+			echo "graph_info Power consumption as a percentage of the max power limit for each GPU"
+			;;
+		rx)
+			echo 'graph_title GPU PCIe Receive Throughput'
+			echo 'graph_vlabel Bits/sec'
+			echo 'graph_category system'
+			echo "graph_info PCIe Receive Throughput of AMD GPUs using driver version $driverVersion"
+			;;
+		tx)
+			echo 'graph_title GPU PCIe Transmit Throughput'
+			echo 'graph_vlabel Bits/sec'
+			echo 'graph_category system'
+			echo "graph_info PCIe Transmit Throughput of AMD GPUs using driver version $driverVersion"
+			;;
+		*)
+			echo "Can't run without a proper symlink. Exiting." >&2
+			echo "Try running munin-node-configure --suggest." >&2
+			exit 1
+			;;
+	esac
+
+	# Per-GPU warning/critical thresholds (for temp) and labels
+	if [ "$name" = "temp" ]; then
+		for ((i = 0; i < nGpus; i++)); do
+			gpuName=$(get_gpu_name "$i")
+			echo "${name}${i}.warning ${warn_temp}"
+			echo "${name}${i}.critical ${crit_temp}"
+			echo "${name}${i}.info Temperature information for ${gpuName}"
+		done
+	fi
+
+	for ((i = 0; i < nGpus; i++)); do
+		gpuName=$(get_gpu_name "$i")
+		echo "${name}${i}.label ${gpuName}"
+	done
+
+	exit 0
+fi
+
+# --- value output ---
+case $name in
+	temp)
+		for ((i = 0; i < nGpus; i++)); do
+			get_metric "$i" "temperature_edge (C)"
+			val=$(get_metric_num "$get_metric_result")
+			echo "${name}${i}.value $val"
+		done
+		;;
+	mem)
+		for ((i = 0; i < nGpus; i++)); do
+			get_metric "$i" "GPU Memory Allocated (VRAM%)"
+			val=$(get_metric_num "$get_metric_result")
+			echo "${name}${i}.value $val"
+		done
+		;;
+	fan)
+		for ((i = 0; i < nGpus; i++)); do
+			get_metric "$i" "current_fan_speed (rpm)"
+			val=$(get_metric_num "$get_metric_result")
+			echo "${name}${i}.value $val"
+		done
+		;;
+	power)
+		for ((i = 0; i < nGpus; i++)); do
+			get_metric "$i" "Average Graphics Package Power (W)"
+			val=$(get_metric_num "$get_metric_result")
+			echo "${name}${i}.value $val"
+		done
+		;;
+	utilization)
+		for ((i = 0; i < nGpus; i++)); do
+			get_metric "$i" "Average Graphics Package Power (W)"
+			power_val=${get_metric_result}
+			get_metric "$i" "Max Graphics Package Power (W)"
+			max_power=$(get_metric_num "$get_metric_result")
+			[ "$max_power" = "0" ] || [ -z "$max_power" ] && max_power=1
+			avg_power=$(get_metric_num "$power_val")
+			val=$(awk "BEGIN {printf \"%.1f\", $avg_power / $max_power * 100}")
+			echo "${name}${i}.value $val"
+		done
+		;;
+	rx)
+		for ((i = 0; i < nGpus; i++)); do
+			get_metric "$i" "pcie_bandwidth_acc (GB/s)"
+			val=$(get_metric_num "$get_metric_result")
+			bps=$(awk "BEGIN {printf \"%.0f\", $val * 8000000000}")
+			echo "${name}${i}.value $bps"
+		done
+		;;
+	tx)
+		for ((i = 0; i < nGpus; i++)); do
+			get_metric "$i" "pcie_bandwidth_acc (GB/s)"
+			val=$(get_metric_num "$get_metric_result")
+			bps=$(awk "BEGIN {printf \"%.0f\", $val * 8000000000}")
+			echo "${name}${i}.value $bps"
+		done
+		;;
+	*)
+		echo "Can't run without a proper symlink. Exiting." >&2
+		echo "Try running munin-node-configure --suggest." >&2
+		exit 1
+		;;
+esac
